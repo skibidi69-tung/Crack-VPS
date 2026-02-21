@@ -1,103 +1,136 @@
-name: Build UML Kernel LTS (Optimized)
+name: Build UML Kernel (LTS kernel)
 
 on:
   schedule:
-    - cron: '0 12 * * *' # Chạy tự động hàng ngày
-  workflow_dispatch: # Cho phép chạy thủ công
+      - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Log level'
+        required: true
+        default: 'warning'
+        type: choice
+        options:
+        - info
+        - warning
+        - debug
+      tags:
+        description: 'Test scenario tags'
+        required: false
+        type: string
 
 jobs:
   build:
-    runs-on: ubuntu-24.04 # Sử dụng Ubuntu mới nhất để có GCC mới
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v2
 
       - name: Set up the environment
         run: |
           sudo apt-get update -y
           sudo apt-get install -y build-essential libncurses-dev flex bison \
               libssl-dev libelf-dev bc dwarves wget curl tar xz-utils qemu-utils \
-              systemd-container libglib2.0-dev libpcre2-dev pkg-config libpcre3-dev upx-ucl jq
+              systemd-container libglib2.0-dev libpcre2-dev pkg-config libpcre3-dev
 
-      - name: Download Latest LTS Kernel Source
+      - name: Download Kernel Source
         run: |
-          # Tự động lấy phiên bản LTS mới nhất từ API kernel.org
           KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.releases[] | select(.moniker=="longterm") | .version' | sort -V | tail -n 1)
           KURL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KVER}.tar.xz"
           echo "[+] Downloading kernel ${KVER}"
           wget -O linux.tar.xz "$KURL"
           tar -xf linux.tar.xz
-          echo "KVER=$KVER" >> $GITHUB_ENV
-
-      - name: Build Slirp Helper
-        run: |
-          cat <<EOF > slirp_helper.c
-          #include <stdio.h>
-          #include <stdlib.h>
-          int main() {
-              return system("slirp4netns -c -e 3 -r 4 --netns-type=path /dev/stdin eth0");
-          }
-          EOF
-          gcc -O2 slirp_helper.c -o slirp-helper
-          strip slirp-helper
-          upx --best slirp-helper
+          cd linux-${KVER}
 
       - name: Build UML kernel
         run: |
-          cd linux-${{ env.KVER }}
+          KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.releases[] | select(.moniker=="longterm") | .version' | sort -V | tail -n 1)
+          cd linux-${KVER}
           echo "[+] Configuring UML kernel..."
           make ARCH=um defconfig
-          
-          # Sử dụng script/config để bật các tính năng cần thiết cho Ubuntu 24.04 & Networking
-          ./scripts/config --file .config \
-              -e CONFIG_BLK_DEV_UBD -e CONFIG_BLK_DEV_LOOP -e CONFIG_EXT4_FS \
-              -e CONFIG_NET -e CONFIG_INET -e CONFIG_UML_NET_SLIRP -e CONFIG_TUN \
-              -e CONFIG_DEVTMPFS -e CONFIG_DEVTMPFS_MOUNT -e CONFIG_TMPFS \
-              -e CONFIG_TMPFS_POSIX_ACL -e CONFIG_TMPFS_XATTR \
-              -e CONFIG_NAMESPACES -e CONFIG_UTS_NS -e CONFIG_IPC_NS -e CONFIG_PID_NS -e CONFIG_NET_NS \
-              -e CONFIG_CGROUPS -e CONFIG_CGROUP_BPF -e CONFIG_MEMCG -e CONFIG_OVERLAY_FS \
-              -e CONFIG_IKCONFIG -e CONFIG_IKCONFIG_PROC -e CONFIG_FHANDLE
-          
+          scripts/config --file .config \
+              -e CONFIG_BLK_DEV \
+              -e CONFIG_BLK_DEV_LOOP \
+              -e CONFIG_BLK_DEV_UBD \
+              -e CONFIG_EXT4_FS \
+              -e CONFIG_EXT2_FS \
+              -e CONFIG_EXT3_FS \
+              -e CONFIG_FS_MBCACHE \
+              -e CONFIG_NET \
+              -e CONFIG_INET \
+              -e CONFIG_PACKET \
+              -e CONFIG_NETDEVICES \
+              -e CONFIG_NET_CORE \
+              -e CONFIG_TUN \
+              -e CONFIG_SLHC \
+              -e CONFIG_SLIP \
+              -e CONFIG_SLIP_COMPRESSED \
+              -e CONFIG_SLIP_SMART \
+              -e CONFIG_SLIP_MODE_SLIP6 \
+              -e CONFIG_UML_NET \
+              -e CONFIG_UML_NET_SLIRP \
+              -d CONFIG_UML_NET_DAEMON \
+              -e CONFIG_TTY \
+              -e CONFIG_UNIX98_PTYS \
+              -e CONFIG_DEVPTS_MULTIPLE_INSTANCES \
+              -e CONFIG_DEVTMPFS \
+              -e CONFIG_DEVTMPFS_MOUNT \
+              -e CONFIG_TMPFS \
+              -e CONFIG_TMPFS_POSIX_ACL \
+              -e CONFIG_TMPFS_XATTR \
+              -e CONFIG_PROC_FS \
+              -e CONFIG_SYSFS \
+              -e CONFIG_FHANDLE \
+              -e CONFIG_SIGNALFD \
+              -e CONFIG_TIMERFD \
+              -e CONFIG_EPOLL \
+              -e CONFIG_EVENTFD \
+              -e CONFIG_BLK_DEV_INITRD \
+              -e CONFIG_OVERLAY_FS \
+              -e CONFIG_CGROUPS \
+              -e CONFIG_CGROUP_SCHED \
+              -e CONFIG_NAMESPACES \
+              -e CONFIG_UTS_NS \
+              -e CONFIG_IPC_NS \
+              -e CONFIG_PID_NS \
+              -e CONFIG_NET_NS \
+              -e CONFIG_DEVPTS_FS \
+              -e CONFIG_PTY \
+              -d CONFIG_AUDIT \
+              -d CONFIG_AUTOFS_FS \
+              -d CONFIG_AUTOFS4_FS \
+              -e CONFIG_COMPAT \
+              -e CONFIG_NETFILTER \
+              -e CONFIG_NF_CONNTRACK \
+              -e CONFIG_NF_CONNTRACK_IPV4 \
+              -e CONFIG_NF_NAT \
+              -e CONFIG_NF_NAT_IPV4 \
+              -e CONFIG_IP_FORWARD \
+              -e CONFIG_IP_MULTICAST \
+              -e CONFIG_IP_ADVANCED_ROUTER \
+              -e CONFIG_UML_SMP \
+              -e CONFIG_IKCONFIG \
+              -e CONFIG_IKCONFIG_PROC
           make ARCH=um olddefconfig
-          
-          echo "[+] Building UML kernel..."
-          make ARCH=um -j$(nproc)
-          
-          # Tối ưu hóa binary kernel
-          strip vmlinux
-          upx --best vmlinux
-          cp vmlinux ../vmlinux-bin
 
-      - name: Create Ubuntu 24.04 RootFS
+          echo "[+] Building UML kernel (this may take ~5–15 min)"
+          make ARCH=um \
+              HOSTCC=gcc \
+              CC=gcc \
+              KCFLAGS="-static  -lglib-2.0 -lpcre -lm -fno-pie" \
+              LDFLAGS="-static -lglib-2.0 -lpcre -lm -Wl,--no-dynamic-linker" \
+              -j"$(nproc)"
+
+      - name: Strip the kernel
         run: |
-          truncate -s 4G rootfs.img
-          mkfs.ext4 rootfs.img
-          mkdir mnt_root
-          sudo mount -o loop rootfs.img mnt_root
-          
-          # Tải RootFS Ubuntu 24.04 (Noble)
-          wget https://images.linuxcontainers.org/images/ubuntu/noble/amd64/default/20260221_07:42/rootfs.tar.xz
-          sudo tar -xJf rootfs.tar.xz -C mnt_root/
-          
-          # Cấu hình DNS & Network script
-          echo "nameserver 8.8.8.8" | sudo tee mnt_root/etc/resolv.conf
-          cat <<EOF | sudo tee mnt_root/root/init_net.sh
-          #!/bin/bash
-          ip addr add 10.0.2.15/24 dev eth0
-          ip link set eth0 up
-          ip route add default via 10.0.2.2
-          echo "Ubuntu 24.04 is ready!"
-          EOF
-          sudo chmod +x mnt_root/root/init_net.sh
-          sudo umount mnt_root
+          KVER=$(curl -s https://www.kernel.org/releases.json | jq -r '.releases[] | select(.moniker=="longterm") | .version' | sort -V | tail -n 1)
+          cp linux-${KVER}/linux ./linux
+          strip ./linux
 
-      - name: Package and Upload
-        run: |
-          tar -cvzf uml-ubuntu-24-noble.tar.gz vmlinux-bin rootfs.img slirp-helper
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload Kernel artifact
+        uses: actions/upload-artifact@v6.0.0
         with:
-          name: linux-uml-ubuntu-24
-          path: uml-ubuntu-24-noble.tar.gz
+          name: linux-uml
+          path: ./linux
+
