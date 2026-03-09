@@ -41,7 +41,6 @@ jobs:
           echo "[+] Downloading kernel ${KVER}"
           wget -O linux.tar.xz "$KURL"
           tar -xf linux.tar.xz
-          cd linux-${KVER}
 
       - name: Build UML kernel
         run: |
@@ -133,4 +132,3 @@ jobs:
         with:
           name: linux-uml
           path: ./linux
-
