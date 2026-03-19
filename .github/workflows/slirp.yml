@@ -1,0 +1,389 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <sys/uio.h>
+#include <limits.h>
+
+#include <libvdeslirp.h>
+
+/*
+    Minimal slirp(1) replacement based on libvdeslirp <https://github.com/virtualsquare/libvdeslirp>
+
+    Build using accompanied Makefile
+    Use with User Mode Linux:
+        ./vmlinux ... eth0=slirp,,/path/to/slirp
+        # ip a add dev eth0 10.0.2.1 && ip l set eth0 up && ip r add default dev eth0
+        # echo nameserver 10.0.2.3 >/etc/resolv.conf
+
+    Additional feature:
+    - If a file named "slirp_config" exists (in the same directory as the binary,
+      or in the current working directory), it is read line by line.
+    - Each non-empty, non-comment line must be of the form:
+          [guest_port]:[host_port]
+      Example:
+          22:2222
+          5900:59000
+    - For each valid line, a port forward is set up:
+          host port -> guest port (guest IP = MYIP).
+*/
+
+// SLIP special character codes
+#define END     0300 // indicates end of packet
+#define ESC     0333 // indicates byte stuffing
+#define ESC_END 0334 // ESC ESC_END means END data byte
+#define ESC_ESC 0335 // ESC ESC_ESC means ESC data byte
+
+#define END_S "\300"
+
+#define MAXPKT 1600
+#define SLIP_MAXPKT (MAXPKT) * 2 + 2
+
+#define MYIP "\x0a\x00\x02\x01"
+#define MYMAC "\xaa\xaa\xaa\xaa\xaa\xaa"
+#define GATEWAYMAC "\x52\x55\x0a\x00\x02\x02" /* SLIRP default */
+
+struct slip_recv_state {
+    uint8_t _pad1[14]; // so we can safely prepend eth header without copying
+    uint8_t buf[SLIP_MAXPKT];
+    uint8_t _pad2[14]; // same idea
+    uint8_t scratch[MAXPKT];
+    size_t index, discard;
+};
+
+static void slip_send(int fd, const uint8_t *pkt, size_t pktlen);
+static uint8_t *slip_recv(int fd, struct slip_recv_state *s, size_t *pktlen);
+
+static void slip_to_outside(struct vdeslirp *myslirp, uint8_t *pkt, size_t pktlen);
+static void outside_to_slip(struct vdeslirp *myslirp, const uint8_t *pkt, size_t pktlen);
+
+/*
+    Read "slirp_config" and set up port forwards.
+
+    Search order:
+    1. Same directory as the executable (derived from exe_path / argv[0])
+    2. Current working directory
+
+    File format (per line):
+        guest_port:host_port
+    Lines beginning with '#' or ';' or empty lines are ignored.
+*/
+static void setup_port_forwards_from_file(struct vdeslirp *myslirp, const char *exe_path)
+{
+    char candidate[PATH_MAX];
+    const char *used_path = NULL;
+    FILE *f = NULL;
+
+    /* Try: same directory as executable */
+    const char *slash = strrchr(exe_path, '/');
+    if (slash) {
+        size_t dirlen = (size_t)(slash - exe_path);
+        if (dirlen >= sizeof(candidate))
+            dirlen = sizeof(candidate) - 1;
+
+        memcpy(candidate, exe_path, dirlen);
+        candidate[dirlen] = '\0';
+
+        if (dirlen + 1 + strlen("slirp_config") < sizeof(candidate)) {
+            strcat(candidate, "/");
+            strcat(candidate, "slirp_config");
+            f = fopen(candidate, "r");
+            if (f)
+                used_path = candidate;
+        }
+    }
+
+    /* Fallback: "slirp_config" in current working directory */
+    if (!f) {
+        strncpy(candidate, "slirp_config", sizeof(candidate));
+        candidate[sizeof(candidate) - 1] = '\0';
+        f = fopen(candidate, "r");
+        if (f)
+            used_path = candidate;
+    }
+
+    if (!f)
+        return; /* No config file found, nothing to do */
+
+    fprintf(stderr, "slirp: loading port forwards from %s\n", used_path);
+
+    struct in_addr in_myip;
+    memcpy(&in_myip.s_addr, MYIP, 4);
+
+    char line[128];
+    unsigned long guest_port_ul, host_port_ul;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+
+        /* Skip leading whitespace */
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        /* Skip empty or comment lines */
+        if (*p == '\0' || *p == '\n' || *p == '#' || *p == ';')
+            continue;
+
+        /* Parse "guest:host" */
+        if (sscanf(p, "%lu:%lu", &guest_port_ul, &host_port_ul) != 2) {
+            fprintf(stderr, "slirp_config: invalid line (expected guest:host): %s", line);
+            continue;
+        }
+
+        /* Validate port range */
+        if (guest_port_ul == 0 || guest_port_ul > 65535 ||
+            host_port_ul == 0 || host_port_ul > 65535) {
+            fprintf(stderr, "slirp_config: invalid port numbers: %s", line);
+            continue;
+        }
+
+        uint16_t guest_port = (uint16_t)guest_port_ul;
+        uint16_t host_port  = (uint16_t)host_port_ul;
+
+        /*
+            vdeslirp_add_fwd arguments:
+                - myslirp: slirp instance
+                - is_udp: 0 for TCP
+                - host address: INADDR_ANY (all interfaces)
+                - host port
+                - guest address
+                - guest port
+        */
+        int rc = vdeslirp_add_fwd(myslirp, 0,
+                                  (struct in_addr){ INADDR_ANY }, host_port,
+                                  in_myip, guest_port);
+
+        if (rc != 0) {
+            fprintf(stderr, "slirp: failed to add forward host %u -> guest %u (rc=%d)\n",
+                    host_port, guest_port, rc);
+        } else {
+            fprintf(stderr, "slirp: forward host %u -> guest %u enabled\n",
+                    host_port, guest_port);
+        }
+    }
+
+    fclose(f);
+}
+
+int main(int argc, char *argv[])
+{
+    SlirpConfig slirpcfg;
+    vdeslirp_init(&slirpcfg, VDE_INIT_DEFAULT);
+    slirpcfg.in6_enabled = false;
+
+    struct vdeslirp *myslirp = vdeslirp_open(&slirpcfg);
+    if (!myslirp) {
+        fprintf(stderr, "vdeslirp_open failed\n");
+        return 1;
+    }
+
+    /* Set up port forwarding from slirp_config file if present */
+    if (argc > 0)
+        setup_port_forwards_from_file(myslirp, argv[0]);
+    else
+        setup_port_forwards_from_file(myslirp, "slirp"); /* fallback name */
+
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags == -1 || fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl");
+        return 1;
+    }
+
+    fprintf(stderr, " --- slirp ready --- \n");
+
+    struct pollfd fds[2];
+    fds[0].fd = vdeslirp_fd(myslirp);
+    fds[0].events = POLLIN;
+    fds[1].fd = STDIN_FILENO;
+    fds[1].events = POLLIN;
+
+    struct slip_recv_state ss;
+    memset(&ss, 0, sizeof(ss));
+
+    while (1) {
+        int n = poll(fds, 2, -1);
+        if (n == -1)
+            return perror("poll"), 1;
+        else if (n == 0)
+            continue;
+
+        if ((fds[0].revents | fds[1].revents) & POLLHUP)
+            goto exit;
+
+        if (fds[0].revents) {
+            uint8_t buf[MAXPKT + 14];
+            ssize_t nread = vdeslirp_recv(myslirp, buf, sizeof(buf));
+            if (nread > 0)
+                outside_to_slip(myslirp, buf, (size_t)nread);
+        }
+
+        if (fds[1].revents) {
+            uint8_t *pkt;
+            size_t pktlen;
+            while ((pkt = slip_recv(STDIN_FILENO, &ss, &pktlen)) != NULL)
+                slip_to_outside(myslirp, pkt, pktlen);
+        }
+    }
+
+exit:
+    vdeslirp_close(myslirp);
+    return 0;
+}
+
+static void slip_to_outside(struct vdeslirp *myslirp, uint8_t *pkt, size_t pktlen)
+{
+    /* Prepend Ethernet header (we reserved 14 bytes before pkt) */
+    pkt -= 14;
+    memcpy(pkt, GATEWAYMAC, 6);   // destination MAC
+    memcpy(pkt + 6, MYMAC, 6);    // source MAC
+    memcpy(pkt + 12, "\x08\x00", 2); // protocol = IPv4
+    vdeslirp_send(myslirp, pkt, pktlen + 14);
+}
+
+static void outside_to_slip(struct vdeslirp *myslirp, const uint8_t *pkt, size_t pktlen)
+{
+    (void)myslirp; /* unused in this function except via vdeslirp_send */
+
+    if (pktlen < 14)
+        return;
+
+    uint16_t proto;
+    memcpy(&proto, pkt + 12, 2);
+
+    if (proto == htons(0x0806)) {
+        /* ARP: answer ARP requests for MYIP */
+        if (pktlen < 42 ||
+            memcmp(pkt + 14, "\x00\x01\x08\x00", 4) != 0 || // Ethernet + IPv4
+            memcmp(pkt + 20, "\x00\x01", 2) != 0 ||          // opcode: request
+            memcmp(pkt + 38, MYIP, 4) != 0)                  // target IP is MYIP
+            return;
+
+        uint8_t buf[42];
+        /*
+            Build ARP reply:
+            Ethernet header: [dest MAC][src MAC][type]
+            ARP payload: hardware type, protocol type, sizes, opcode, sender MAC/IP, target MAC/IP
+        */
+        memcpy(buf + 6, MYMAC
+               "\x08\x06"
+               "\x00\x01" "\x08\x00" "\x06" "\x04"
+               "\x00\x02"
+               MYMAC MYIP, 26);
+        memcpy(buf, pkt + 22, 6);       // destination MAC
+        memcpy(buf + 32, pkt + 22, 10); // target MAC/IP from request
+        vdeslirp_send(myslirp, buf, 42);
+
+    } else if (proto == htons(0x0800)) {
+        /* IPv4: forward only if destination MAC is ours */
+        if (memcmp(pkt, MYMAC, 6) != 0)
+            return;
+        slip_send(STDOUT_FILENO, pkt + 14, pktlen - 14);
+    }
+}
+
+static void slip_send(int fd, const uint8_t *pkt, size_t pktlen)
+{
+    /* Fast path: no END or ESC, we can send as a single chunk with boundaries */
+    if (!memchr(pkt, END, pktlen) && !memchr(pkt, ESC, pktlen)) {
+        struct iovec iov[3] = {
+            { .iov_base = (void *)END_S, .iov_len = 1 },
+            { .iov_base = (void *)pkt,   .iov_len = pktlen },
+            { .iov_base = (void *)END_S, .iov_len = 1 }
+        };
+        writev(fd, iov, 3);
+        return;
+    }
+
+    if (pktlen > MAXPKT)
+        pktlen = MAXPKT;
+
+    uint8_t buf[SLIP_MAXPKT];
+    size_t i = 0;
+    buf[i++] = END;
+
+    while (pktlen > 0) {
+        if (*pkt == END) {
+            buf[i++] = ESC;
+            buf[i++] = ESC_END;
+        } else if (*pkt == ESC) {
+            buf[i++] = ESC;
+            buf[i++] = ESC_ESC;
+        } else {
+            buf[i++] = *pkt;
+        }
+        pkt++;
+        pktlen--;
+    }
+
+    buf[i++] = END;
+    write(fd, buf, i);
+}
+
+static uint8_t *slip_recv(int fd, struct slip_recv_state *s, size_t *pktlen)
+{
+    uint8_t *p;
+
+    /* Check if we already have an END in the buffered data */
+    if (s->index > s->discard &&
+        (p = memchr(s->buf + s->discard, END, s->index - s->discard)))
+        goto segment;
+
+    /*
+        Read more data until we see an END byte.
+        The state machine keeps previously read bytes between calls.
+    */
+    do {
+        if (s->discard) {
+            /* Compact buffer if we have discarded some bytes */
+            s->index -= s->discard;
+            memmove(s->buf, s->buf + s->discard, s->index);
+            s->discard = 0;
+        }
+
+        if (s->index >= SLIP_MAXPKT)
+            s->index = 0;
+
+        ssize_t n = read(fd, s->buf + s->index, SLIP_MAXPKT - s->index);
+        if (n <= 0)
+            return NULL;
+
+        s->index += (size_t)n;
+        p = memchr(s->buf, END, s->index);
+    } while (!p);
+
+segment:
+    (void)0;
+
+    uint8_t *base = s->buf + s->discard;
+    *pktlen = (size_t)(p - base);
+
+    /* Empty packet: skip this END and try again */
+    if (!*pktlen) {
+        s->discard++;
+        return slip_recv(fd, s, pktlen);
+    }
+
+    /* No ESC in the packet: return pointer directly into buffer */
+    if (!memchr(base, ESC, *pktlen)) {
+        s->discard += *pktlen;
+        return base;
+    } else {
+        /* Unescape into scratch buffer */
+        size_t i = 0;
+        for (size_t c = 0; c < *pktlen && i < MAXPKT; c++) {
+            if (base[c] == ESC) {
+                /* Next byte determines whether it was END or ESC */
+                s->scratch[i++] = (base[++c] == ESC_END) ? END : ESC;
+            } else {
+                s->scratch[i++] = base[c];
+            }
+        }
+        s->discard += *pktlen;
+        *pktlen = i;
+        return s->scratch;
+    }
+}
